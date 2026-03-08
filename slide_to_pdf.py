@@ -24,7 +24,6 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 def parse_slide_count(page) -> int:
     """Parse le compteur de slides 'X sur Y' pour obtenir le nombre total."""
     try:
-        # Cherche le texte du type "1 sur 82" ou "1 of 82" dans la barre de statut
         counter_text = page.locator("text=/\\d+\\s+(sur|of|de|von)\\s+\\d+/i").first.inner_text(timeout=10000)
         match = re.search(r"(\d+)\s+(?:sur|of|de|von)\s+(\d+)", counter_text, re.IGNORECASE)
         if match:
@@ -49,7 +48,6 @@ def accept_cookies(page):
             btn = page.locator(selector).first
             if btn.is_visible(timeout=2000):
                 btn.click()
-                print("  -> Cookies acceptés")
                 time.sleep(1)
                 return True
         except Exception:
@@ -58,105 +56,112 @@ def accept_cookies(page):
 
 
 def wait_for_slide_content(page, timeout_sec: float = 8):
-    """
-    Attend que le contenu de la slide soit réellement rendu.
-    Vérifie que les images/canvas/SVG dans la zone de slide sont chargés.
-    """
-    # Attente de base pour le rendu
+    """Attend que le contenu de la slide soit réellement rendu."""
     time.sleep(1.5)
-
-    # Attend que le réseau soit au repos (pas de requêtes en cours)
     try:
         page.wait_for_load_state("networkidle", timeout=timeout_sec * 1000)
     except PlaywrightTimeout:
         pass
-
-    # Attente supplémentaire pour le rendu visuel
     time.sleep(1)
 
 
 def is_slide_blank(screenshot_path: Path, threshold: float = 0.97) -> bool:
-    """
-    Vérifie si une capture d'écran est principalement vide/blanche.
-    Retourne True si plus de `threshold` des pixels sont quasi-blancs.
-    """
-    img = Image.open(screenshot_path).convert("L")  # Convertir en niveaux de gris
+    """Vérifie si une capture d'écran est principalement vide/blanche."""
+    img = Image.open(screenshot_path).convert("L")
     pixels = list(img.getdata())
     total = len(pixels)
-    # Compter les pixels très clairs (presque blancs, > 240)
     white_count = sum(1 for p in pixels if p > 240)
     ratio = white_count / total
     return ratio > threshold
 
 
-def capture_slides(url: str, output_dir: Path, timeout_sec: float = 8, max_retries: int = 2):
-    """Capture chaque slide en screenshot PNG."""
+def capture_slides(url: str, output_dir: Path, timeout_sec: float = 8,
+                   max_retries: int = 2, on_progress=None, cancel_event=None):
+    """
+    Capture chaque slide en screenshot PNG.
+
+    on_progress: callback(event, data) pour signaler la progression.
+        Événements:
+        - "log": data = message string
+        - "slide_total": data = nombre total de slides
+        - "slide_captured": data = {"index": i, "total": total, "status": "ok"|"blank"|"retry", "path": path}
+        - "done": data = liste des screenshots
+    cancel_event: threading.Event, si set() le processus s'arrête.
+    """
     screenshots = []
 
+    def log(msg):
+        if on_progress:
+            on_progress("log", msg)
+        print(msg)
+
     with sync_playwright() as p:
-        print("Lancement du navigateur...")
+        log("Lancement du navigateur...")
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            device_scale_factor=2,  # Haute résolution pour des captures nettes
+            device_scale_factor=2,
         )
         page = context.new_page()
 
-        print(f"Chargement de {url}...")
+        log(f"Chargement de {url}...")
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         time.sleep(3)
 
-        # Accepter les cookies
         accept_cookies(page)
+        log("Cookies acceptés.")
         time.sleep(2)
 
-        # Attendre le chargement initial
         wait_for_slide_content(page, timeout_sec)
 
-        # Déterminer le nombre total de slides
         total_slides = parse_slide_count(page)
         if total_slides == 0:
-            print("Impossible de détecter le nombre de slides. Utilisation du mode exploration.")
-            total_slides = 200  # Limite de sécurité
+            log("Impossible de détecter le nombre de slides. Mode exploration activé.")
+            total_slides = 200
 
-        print(f"Nombre de slides détecté : {total_slides}")
+        log(f"Nombre de slides détecté : {total_slides}")
+        if on_progress:
+            on_progress("slide_total", total_slides)
 
-        # Capturer chaque slide
         consecutive_blanks = 0
         for i in range(1, total_slides + 1):
+            if cancel_event and cancel_event.is_set():
+                log("Capture annulée par l'utilisateur.")
+                break
+
             slide_path = output_dir / f"slide_{i:04d}.png"
-            print(f"  Capture slide {i}/{total_slides}...", end="", flush=True)
+            log(f"  Capture slide {i}/{total_slides}...")
 
-            # Attendre le rendu de la slide
             wait_for_slide_content(page, timeout_sec)
-
-            # Prendre la capture d'écran
             page.screenshot(path=str(slide_path), full_page=False)
 
-            # Vérifier si la slide est vide et réessayer si nécessaire
             retry_count = 0
             while is_slide_blank(slide_path) and retry_count < max_retries:
                 retry_count += 1
-                print(f" (réessai {retry_count})...", end="", flush=True)
+                log(f"    Réessai {retry_count}...")
+                if on_progress:
+                    on_progress("slide_captured", {"index": i, "total": total_slides, "status": "retry", "path": None})
                 time.sleep(3)
                 wait_for_slide_content(page, timeout_sec)
                 page.screenshot(path=str(slide_path), full_page=False)
 
             if is_slide_blank(slide_path):
                 consecutive_blanks += 1
-                print(" [VIDE - ignorée]")
-                slide_path.unlink()  # Supprimer la capture vide
+                log(f"  Slide {i} [VIDE - ignorée]")
+                if on_progress:
+                    on_progress("slide_captured", {"index": i, "total": total_slides, "status": "blank", "path": None})
+                slide_path.unlink()
                 if consecutive_blanks >= 5 and total_slides == 200:
-                    print("  -> 5 slides vides consécutives, fin de la présentation.")
+                    log("5 slides vides consécutives, fin de la présentation.")
                     break
             else:
                 consecutive_blanks = 0
                 screenshots.append(slide_path)
-                print(" OK")
+                log(f"  Slide {i} OK")
+                if on_progress:
+                    on_progress("slide_captured", {"index": i, "total": total_slides, "status": "ok", "path": str(slide_path)})
 
-            # Naviguer vers la slide suivante (flèche droite)
             if i < total_slides:
-                # Essayer de cliquer sur le bouton "suivant"
                 try:
                     next_btn = page.locator('[aria-label="Next"]').first
                     if next_btn.is_visible(timeout=1000):
@@ -164,39 +169,73 @@ def capture_slides(url: str, output_dir: Path, timeout_sec: float = 8, max_retri
                         continue
                 except Exception:
                     pass
-
-                # Fallback : touche flèche droite
                 page.keyboard.press("ArrowRight")
 
         browser.close()
 
+    if on_progress:
+        on_progress("done", screenshots)
+
     return screenshots
 
 
-def screenshots_to_pdf(screenshots: list[Path], output_pdf: Path):
-    """Assemble les captures d'écran en un seul fichier PDF."""
+def screenshots_to_pdf(screenshots: list[Path], output_pdf: Path,
+                       optimize: bool = True, max_width: int = 1400,
+                       jpeg_quality: int = 60, on_progress=None):
+    """
+    Assemble les captures d'écran en un seul fichier PDF optimisé.
+
+    optimize: active la compression (redimensionnement + JPEG)
+    max_width: largeur max en pixels (les images plus larges sont réduites)
+    jpeg_quality: qualité JPEG (1-95, plus bas = plus petit fichier)
+    """
     if not screenshots:
+        if on_progress:
+            on_progress("log", "Aucune slide capturée !")
         print("Aucune slide capturée !")
         return False
 
-    print(f"\nAssemblage de {len(screenshots)} slides en PDF...")
+    msg = f"Assemblage de {len(screenshots)} slides en PDF..."
+    if on_progress:
+        on_progress("log", msg)
+    print(msg)
 
     images = []
     for path in screenshots:
         img = Image.open(path).convert("RGB")
+
+        if optimize:
+            # Redimensionner si l'image est trop large
+            if img.width > max_width:
+                ratio = max_width / img.width
+                new_height = int(img.height * ratio)
+                img = img.resize((max_width, new_height), Image.LANCZOS)
+
         images.append(img)
 
-    # Sauvegarder le PDF
     first_image = images[0]
     remaining = images[1:] if len(images) > 1 else []
-    first_image.save(
-        str(output_pdf),
-        save_all=True,
-        append_images=remaining,
-        resolution=150,
-    )
 
-    print(f"PDF créé : {output_pdf} ({len(images)} pages)")
+    # Sauvegarder avec compression optimisée
+    save_kwargs = {
+        "save_all": True,
+        "append_images": remaining,
+    }
+
+    if optimize:
+        save_kwargs["resolution"] = 72  # 72 DPI pour publication en ligne
+        save_kwargs["optimize"] = True
+    else:
+        save_kwargs["resolution"] = 150
+
+    first_image.save(str(output_pdf), **save_kwargs)
+
+    file_size = output_pdf.stat().st_size
+    size_mb = file_size / (1024 * 1024)
+    result_msg = f"PDF créé : {output_pdf} ({len(images)} pages, {size_mb:.1f} Mo)"
+    if on_progress:
+        on_progress("log", result_msg)
+    print(result_msg)
     return True
 
 
@@ -209,27 +248,22 @@ def main():
     parser.add_argument("--timeout", type=float, default=8, help="Timeout (sec) d'attente par slide (défaut: 8)")
     parser.add_argument("--retries", type=int, default=2, help="Nombre de réessais pour les slides vides (défaut: 2)")
     parser.add_argument("--keep-screenshots", action="store_true", help="Garder les captures d'écran individuelles")
+    parser.add_argument("--no-optimize", action="store_true", help="Désactiver l'optimisation de taille du PDF")
 
     args = parser.parse_args()
 
-    # Déterminer le nom de sortie
     if args.output:
         output_pdf = Path(args.output)
     else:
-        # Extraire un nom depuis l'URL
         slug = args.url.rstrip("/").split("/")[-1][:20]
         output_pdf = Path(f"slides_{slug}.pdf")
 
-    # Dossier temporaire pour les captures
     tmp_dir = Path("_tmp_slides")
     tmp_dir.mkdir(exist_ok=True)
 
     try:
-        # Capture des slides
         screenshots = capture_slides(args.url, tmp_dir, args.timeout, args.retries)
-
-        # Assemblage en PDF
-        success = screenshots_to_pdf(screenshots, output_pdf)
+        success = screenshots_to_pdf(screenshots, output_pdf, optimize=not args.no_optimize)
 
         if success:
             print(f"\nTerminé ! Fichier : {output_pdf.resolve()}")
@@ -237,7 +271,6 @@ def main():
             print("\nÉchec : aucune slide n'a pu être capturée.")
             sys.exit(1)
     finally:
-        # Nettoyage
         if not args.keep_screenshots and tmp_dir.exists():
             for f in tmp_dir.iterdir():
                 f.unlink()
